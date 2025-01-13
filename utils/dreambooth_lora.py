@@ -9,6 +9,7 @@ import threading
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
+import json
 
 import datasets
 import diffusers
@@ -483,7 +484,9 @@ class DreamBoothDataset(Dataset):
         self.instance_prompt = instance_prompt
         self._length = self.num_instance_images
 
-        if class_data_root is not None:
+        self.class_data_root = class_data_root
+
+        if self.class_data_root is not None:
             self.class_data_root = Path(class_data_root)
             self.class_data_root.mkdir(parents=True, exist_ok=True)
             self.class_images_path = list(self.class_data_root.iterdir())
@@ -1080,6 +1083,66 @@ def main(args):
             )
 
     accelerator.end_training()
+
+class BackboneDreamBoothDataset(DreamBoothDataset):
+    def __init__(self, instance_data_root, instance_prompt, class_data_root, class_prompt, tokenizer, size, center_crop):
+        super().__init__(instance_data_root, instance_prompt, class_data_root, class_prompt, tokenizer, size, center_crop)
+        #check if the prompt is a json file
+        if self.instance_prompt.endswith('.json'):
+            with open(self.instance_prompt, 'r') as f:
+                self.instance_prompt = json.load(f)
+        #make a prompt list from the json file
+        temp_list = []
+        for image in self.instance_prompt.keys():
+            temp_list.append(self.instance_prompt[image]["text"])
+        self.instance_prompt = temp_list
+        self.num_instance_images = len(self.instance_prompt)
+
+        self.tokenizer = tokenizer
+        self.class_data_root = class_data_root
+
+        if self.class_data_root is not None:
+            self.class_data_root = Path(class_data_root)
+            self.class_data_root.mkdir(parents=True, exist_ok=True)
+            self.class_images_path = list(self.class_data_root.iterdir())
+            self.num_class_images = len(self.class_images_path)
+            self._length = max(self.num_class_images, self.num_instance_images)
+            self.class_prompt = class_prompt
+        else:
+            self.class_data_root = None
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, index):
+        example = {}
+        instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
+        instance_prompt = self.instance_prompt[index % self.num_instance_images]
+        if not instance_image.mode == "RGB":
+            instance_image = instance_image.convert("RGB")
+        example["instance_images"] = self.image_transforms(instance_image)
+        example["instance_prompt_ids"] = self.tokenizer(
+            instance_prompt,
+            truncation=True,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            return_tensors="pt",
+        ).input_ids
+
+        if self.class_data_root:
+            class_image = Image.open(self.class_images_path[index % self.num_class_images])
+            if not class_image.mode == "RGB":
+                class_image = class_image.convert("RGB")
+            example["class_images"] = self.image_transforms(class_image)
+            example["class_prompt_ids"] = self.tokenizer(
+                self.class_prompt,
+                truncation=True,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                return_tensors="pt",
+            ).input_ids
+
+        return example
 
 if __name__ == "__main__":
     args = parse_args()

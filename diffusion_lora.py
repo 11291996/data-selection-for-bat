@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import itertools
 import argparse
 from accelerate import Accelerator
-from utils.dreambooth_lora import DreamBoothDataset, import_model_class_from_model_name_or_path, collate_fn
+from utils.dreambooth_lora import DreamBoothDataset, import_model_class_from_model_name_or_path, collate_fn, BackboneDreamBoothDataset
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
@@ -35,6 +35,10 @@ def arg_parse():
     parser.add_argument('--class_data', type=str, default='data/20ng_class.csv', help='path to class data')
     #class prompt
     parser.add_argument('--class_prompt', type=str, default='class', help='prompt for class')
+    #backbone path 
+    parser.add_argument('--backbone_data', type=str, default='backbone/20ng_backbone.pkl', help='path to backbone model')
+    #backbone prompt
+    parser.add_argument('--backbone_prompt', type=str, default='backbone', help='prompt for backbone')
     args = parser.parse_args()
     return args
 
@@ -112,8 +116,27 @@ def compute_gradient(args):
             num_workers=1,
         )
 
-        unet, text_encoder, train_dataloader, test_dataloader = accelerator.prepare(
-            unet, text_encoder, train_dataloader, test_dataloader
+        #backbone dataset
+        backbone_dataset = BackboneDreamBoothDataset( 
+            instance_data_root=args.train_data,
+            instance_prompt=args.backbone_prompt,
+            class_data_root=args.class_data if True else None,
+            class_prompt=args.class_prompt,
+            tokenizer=tokenizer,
+            size=512,
+            center_crop=False,
+        )
+
+        backbone_dataloader = torch.utils.data.DataLoader(
+            backbone_dataset,
+            batch_size=1,
+            shuffle=False,
+            collate_fn=lambda examples: collate_fn(examples, True),
+            num_workers=1,
+        )
+
+        unet, text_encoder, train_dataloader, test_dataloader, backbone_dataloader = accelerator.prepare(
+            unet, text_encoder, train_dataloader, test_dataloader, backbone_dataloader
         )
 
         # Move vae and text_encoder to device and cast to torch.float32
@@ -132,6 +155,68 @@ def compute_gradient(args):
 
         tr_grad_dict = {}
         val_grad_dict = {}
+
+        # for step, batch in enumerate(tqdm(backbone_dataloader)):
+        #     # Forward pass
+        #      with accelerator.accumulate(unet):
+        #         # Convert images to latent space
+
+        #         unet.zero_grad()
+        #         text_encoder.zero_grad()
+
+        #         latents = vae.encode(batch["pixel_values"].to(dtype=torch.float32)).latent_dist.sample()
+        #         latents = latents * 0.18215
+
+        #         # Sample noise that we'll add to the latents
+        #         noise = torch.randn_like(latents)
+        #         bsz = latents.shape[0]
+        #         # Sample a random timestep for each image
+        #         timesteps = torch.randint(
+        #             0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
+        #         )
+        #         timesteps = timesteps.long()
+
+        #         # Add noise to the latents according to the noise magnitude at each timestep
+        #         # (this is the forward diffusion process)
+        #         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+        #         # Get the text embedding for conditioning
+        #         encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+
+        #         # Predict the noise residual
+        #         model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+        #         # Get the target for loss depending on the prediction type
+        #         if noise_scheduler.config.prediction_type == "epsilon":
+        #             target = noise
+        #         elif noise_scheduler.config.prediction_type == "v_prediction":
+        #             target = noise_scheduler.get_velocity(latents, noise, timesteps)
+        #         else:
+        #             raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+        #         # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+        #         model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+        #         target, target_prior = torch.chunk(target, 2, dim=0)
+
+        #         # Compute instance loss
+        #         loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+        #         # Compute prior loss
+        #         prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+
+        #         # Add the prior loss to the instance loss.
+        #         loss = loss + 1 * prior_loss
+
+        #         accelerator.backward(loss)
+
+        #         if accelerator.sync_gradients:
+        #             params_to_clip = (
+        #                 itertools.chain(unet.parameters(), text_encoder.parameters())
+        #                 if True
+        #                 else unet.parameters()
+        #             )
+        #             accelerator.clip_grad_norm_(params_to_clip, 1)
+
 
         for step, batch in enumerate(tqdm(train_dataloader)):
             # Forward pass
@@ -184,7 +269,6 @@ def compute_gradient(args):
                 # Add the prior loss to the instance loss.
                 loss = loss + 1 * prior_loss
 
-                print(f"the loss is {loss}")
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
@@ -257,7 +341,6 @@ def compute_gradient(args):
                 # Add the prior loss to the instance loss.
                 loss = loss + 1 * prior_loss
 
-                print(f"the loss is {loss}")
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
@@ -281,6 +364,81 @@ def compute_gradient(args):
 
     return tr_grad_dict, val_grad_dict
 
+def compute_score(tr_grad_dict, val_grad_dict, backbone_grad_dict, lambda_const_param = 10):
+
+    #TODO: replace later
+    backbone_grad_dict = tr_grad_dict
+
+    #compute Q
+    Q = {}
+    for layer in val_grad_dict[0].keys():
+        Q[layer] = torch.zeros(val_grad_dict[0][layer].shape)
+        for val_id in val_grad_dict:
+            Q[layer] += val_grad_dict[val_id][layer] / len(val_grad_dict.keys())
+    
+    #compute G 
+    G = {}
+    for layer in tr_grad_dict[0].keys():
+        G[layer] = torch.zeros(tr_grad_dict[0][layer].shape)
+        for data in tr_grad_dict:
+            G[layer] += tr_grad_dict[data][layer] / len(tr_grad_dict.keys())
+
+    #compute lambda, QG^-1 and GG^-1
+    q_g_inv = {}
+    g_g_inv = {}
+    lambda_list = []
+
+    for layer in G: 
+        #compute lambda
+        l = torch.zeros(len(tr_grad_dict.keys()))
+        for data in tr_grad_dict:
+            tmp_grad = tr_grad_dict[data][layer]
+            l[data] = torch.mean(tmp_grad**2)
+        lambda_const = torch.mean(l) / lambda_const_param
+        lambda_list.append(lambda_const)
+
+        #compute G^-1 and QG^-1 and GG^-1
+        hvp_1 = torch.zeros(Q[layer].shape)
+        hvp_2 = torch.zeros(G[layer].shape)
+        for data in tr_grad_dict:
+            tmp_grad = tr_grad_dict[data][layer]
+            c_tmp_1 = torch.sum(Q[layer] * tmp_grad) / (lambda_const + torch.sum(tmp_grad**2))
+            c_tmp_2 = torch.sum(G[layer] * tmp_grad) / (lambda_const + torch.sum(tmp_grad**2))
+            #identity matrix is mulitplied with Q[layer] 
+            #calculate the backbone gradient likewise
+            hvp_1 += (Q[layer] - c_tmp_1 * tmp_grad) / (len(tr_grad_dict.keys()) * lambda_const)
+            hvp_2 += (G[layer] - c_tmp_2 * tmp_grad) / (len(tr_grad_dict.keys()) * lambda_const)
+
+        q_g_inv[layer] = hvp_1
+        g_g_inv[layer] = hvp_2
+
+    #calculate G(x)G^-1
+    b_g_inv = {}
+    for data in backbone_grad_dict:
+        tmp_dict = {}
+        for layer, lambda_const in zip(q_g_inv, lambda_list):
+            tmp_grad = tr_grad_dict[data][layer]
+            c_tmp = torch.sum(backbone_grad_dict[data][layer] * tmp_grad) / (lambda_const + torch.sum(tmp_grad**2))
+            hvp = (backbone_grad_dict[data][layer] - c_tmp * tmp_grad) / (len(tr_grad_dict.keys()) * lambda_const)
+            tmp_dict[layer] = hvp
+        b_g_inv[data] = tmp_dict
+
+    #calculate -tr(G(x)G^-1HG^-1) + 2 tr(G(x)G^-1HG^-1GG^-1)
+    score_dict = {}
+    for data in b_g_inv: 
+        score = 0
+        for layer in b_g_inv[data]:
+            tmp_grad = b_g_inv[data][layer] * q_g_inv[layer]
+            score += -torch.trace(tmp_grad) + 2 * torch.trace(tmp_grad * g_g_inv[layer])
+        score_dict[data] = score
+
+    return score_dict
+
 if __name__ == '__main__':
+    import time 
+    start = time.time()
     args = arg_parse()
-    compute_gradient(args)
+    tr_grad_dict, val_grad_dict = compute_gradient(args)
+    score_dict = compute_score(tr_grad_dict, val_grad_dict, None)
+    print(score_dict)
+    print(f"Time taken: {time.time() - start}")
