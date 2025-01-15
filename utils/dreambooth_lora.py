@@ -33,7 +33,8 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import HfApi
-from PIL import Image
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
@@ -72,6 +73,41 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser.add_argument(
+        "--backbone_data_dir",
+        type=str,
+        default=None,
+        required=False,
+        help="A folder containing the training data of backbone images.",
+    )
+    parser.add_argument(
+        "--backbone_prompt",
+        type=str,
+        default=None,
+        required=False,
+        help="The prompt with identifier specifying the backbone images.",
+    )
+    parser.add_argument(
+        "--score_data_dir",
+        type=str,
+        default=None,
+        required=False,
+        help="A folder containing the scores of backbone data.",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=1.0,
+        required=False,
+        help="The proportation of the backbone data.",
+    )
+    parser.add_argument(
+        "--sample_ratio",
+        type=float,
+        default=1.0,
+        required=False,
+        help="The ratio of the backbone data to sample.",
+    )
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
@@ -785,15 +821,33 @@ def main(args):
     )
 
     # Dataset and DataLoaders creation:
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_prompt=args.class_prompt,
-        tokenizer=tokenizer,
-        size=args.resolution,
-        center_crop=args.center_crop,
-    )
+    if args.backbone_data_dir:
+        train_dataset = BackboneDreamBoothDataset( 
+            instance_data_root=args.instance_data_dir,
+            instance_prompt=args.instance_prompt,
+            class_data_root=args.class_data_dir if True else None,
+            class_prompt=args.class_prompt,
+            tokenizer=tokenizer,
+            size=512,
+            center_crop=False,
+            backbone_data_root=args.backbone_data_dir,
+            backbone_prompt=args.backbone_prompt,
+            score_data_root=args.score_data_dir,
+            gamma=args.gamma,
+            sample_ratio=args.sample_ratio
+        )
+    else:
+        train_dataset = DreamBoothDataset(
+            instance_data_root=args.instance_data_dir,
+            instance_prompt=args.instance_prompt,
+            class_data_root=args.class_data_dir if args.with_prior_preservation else None,
+            class_prompt=args.class_prompt,
+            tokenizer=tokenizer,
+            size=args.resolution,
+            center_crop=args.center_crop,
+        )
+
+    exit()
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -1084,23 +1138,67 @@ def main(args):
 
     accelerator.end_training()
 
+from collections import defaultdict
+def compare_score_add_data(json_path, sample_ratio):
+    # Load the JSON file
+    with open(json_path, 'r') as f:
+        score = json.load(f)
+
+    # Convert the score dictionary into a list of tuples (key, value)
+    score_items = list(score.items())
+    
+    # Stratify the data by the score values (or bins of scores)
+    bins = np.linspace(min([float(v) for v in score.values()]), max([float(v) for v in score.values()]), num=10)  # Create 10 bins
+    stratified_scores = defaultdict(list)
+    for k, v in score_items:
+        bin_index = np.digitize(float(v), bins)
+        stratified_scores[bin_index].append((k, v))
+    
+    # Perform proportional sampling from each bin
+    sample_score = {}
+    for bin_index, items in stratified_scores.items():
+        num_samples = max(1, round(len(items) * sample_ratio))  # Ensure at least one sample per bin
+        sampled_items = np.random.choice(len(items), num_samples, replace=False)
+        for idx in sampled_items:
+            key, value = items[idx]
+            sample_score[key] = value
+
+    # Order the sampled score dictionary via the score values
+    sample_score = dict(sorted(sample_score.items(), key=lambda item: float(item[1]), reverse=True))
+
+    return sample_score
+
 class BackboneDreamBoothDataset(DreamBoothDataset):
-    def __init__(self, instance_data_root, instance_prompt, class_data_root, class_prompt, tokenizer, size, center_crop):
+    def __init__(self, 
+    instance_data_root, 
+    instance_prompt, 
+    class_data_root, 
+    class_prompt, 
+    tokenizer, 
+    size, 
+    center_crop, 
+    backbone_data_root=None, 
+    backbone_prompt=None,
+    score_data_root=None, 
+    gamma=None, 
+    sample_ratio=None):
         super().__init__(instance_data_root, instance_prompt, class_data_root, class_prompt, tokenizer, size, center_crop)
+        self.instance_data_root = Path(instance_data_root)
+        self.instance_images_path = sorted(Path(instance_data_root).iterdir(), key=lambda x: int(''.join(filter(str.isdigit, x.name))))
         #check if the prompt is a json file
         if self.instance_prompt.endswith('.json'):
             with open(self.instance_prompt, 'r') as f:
-                self.instance_prompt = json.load(f)
-        #make a prompt list from the json file
-        temp_list = []
-        for image in self.instance_prompt.keys():
-            temp_list.append(self.instance_prompt[image]["text"])
-        self.instance_prompt = temp_list
-        self.num_instance_images = len(self.instance_prompt)
+                self.instance_prompt_dict = json.load(f)
+            #make a prompt list from the json file
+            temp_list = []
+            for image in self.instance_prompt_dict.keys():
+                temp_list.append(self.instance_prompt_dict[image]["text"])
+        
+            self.instance_prompt = temp_list
 
+        self.num_instance_images = len(self.instance_images_path)
         self.tokenizer = tokenizer
         self.class_data_root = class_data_root
-
         if self.class_data_root is not None:
             self.class_data_root = Path(class_data_root)
             self.class_data_root.mkdir(parents=True, exist_ok=True)
@@ -1111,13 +1209,50 @@ class BackboneDreamBoothDataset(DreamBoothDataset):
         else:
             self.class_data_root = None
 
+        #adding the backbone data
+        if backbone_data_root and backbone_prompt and score_data_root and gamma and sample_ratio:
+            self.backbone_data_root = Path(backbone_data_root)
+            self.backbone_data_path = sorted(Path(backbone_data_root).iterdir(), key=lambda x: int(''.join(filter(str.isdigit, x.name))))
+            with open(backbone_prompt, 'r') as f:
+                self.backbone_prompt_dict = json.load(f)
+                #make a prompt list from the json file
+                temp_list = []
+                for image in self.backbone_prompt_dict.keys():
+                    temp_list.append(self.backbone_prompt_dict[image]["text"])
+                
+                self.backbone_prompt = temp_list
+
+            self.score_data_root = score_data_root
+            self.gamma = gamma
+            self.sample_ratio = sample_ratio
+
+            self.sample_score = compare_score_add_data(self.score_data_root, self.sample_ratio)
+
+            #repeat the instance prompt as a list
+            self.instance_prompt = [self.instance_prompt] * self.num_instance_images
+
+            #get the number of backbone images to add 
+            self.num_backbone_images = round(self.num_instance_images * (1 - self.gamma))
+
+            #get the index of the backbone images from the sample score
+            self.backbone_index = list(self.sample_score.keys())[:self.num_backbone_images]
+
+            for idx in self.backbone_index:
+                idx = int(idx)
+                self.instance_images_path.append(self.backbone_data_path[idx])
+                self.instance_prompt.append(self.backbone_prompt[idx])
+
+            
     def __len__(self):
         return self._length
 
     def __getitem__(self, index):
         example = {}
         instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
-        instance_prompt = self.instance_prompt[index % self.num_instance_images]
+        if isinstance(self.instance_prompt, list):
+            instance_prompt = self.instance_prompt[index % self.num_instance_images]
+        else:
+            instance_prompt = self.instance_prompt
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         example["instance_images"] = self.image_transforms(instance_image)
@@ -1130,7 +1265,16 @@ class BackboneDreamBoothDataset(DreamBoothDataset):
         ).input_ids
 
         if self.class_data_root:
-            class_image = Image.open(self.class_images_path[index % self.num_class_images])
+            #matching the class images with the added backbone images
+            if index % self.num_instance_images > self.num_instance_images:
+                #get the idx from self.backbone_index
+                #match the idx with the class image for the backbone image
+                idx = self.backbone_index[(index % self.num_instance_images) - self.num_instance_images]
+                print(idx)
+                class_image = Image.open(self.class_images_path[idx % self.num_class_images])
+            else:
+                class_image = Image.open(self.instance_images_path[index % self.num_instance_images])
+
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
             example["class_images"] = self.image_transforms(class_image)

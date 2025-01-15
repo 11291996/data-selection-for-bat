@@ -19,6 +19,13 @@ from tqdm import tqdm
 UNET_TARGET_MODULES = ["to_q", "to_v", "query", "value"]  # , "ff.net.0.proj"]
 TEXT_ENCODER_TARGET_MODULES = ["q_proj", "v_proj"]
 
+#seed control 
+# torch.manual_seed(0)
+# torch.cuda.manual_seed(0)
+# torch.cuda.manual_seed_all(0)
+# torch.backends.cudnn.deterministic = True
+# torch.backends.cudnn.benchmark = False
+
 def arg_parse():
     parser = argparse.ArgumentParser(description='Influence function for Diffusion LORA')
     #training data path
@@ -118,7 +125,7 @@ def compute_gradient(args):
 
         #backbone dataset
         backbone_dataset = BackboneDreamBoothDataset( 
-            instance_data_root=args.train_data,
+            instance_data_root=args.backbone_data,
             instance_prompt=args.backbone_prompt,
             class_data_root=args.class_data if True else None,
             class_prompt=args.class_prompt,
@@ -155,67 +162,98 @@ def compute_gradient(args):
 
         tr_grad_dict = {}
         val_grad_dict = {}
+        backbone_grad_dict = {}
 
-        # for step, batch in enumerate(tqdm(backbone_dataloader)):
-        #     # Forward pass
-        #      with accelerator.accumulate(unet):
-        #         # Convert images to latent space
+        loss_repeat = 3
 
-        #         unet.zero_grad()
-        #         text_encoder.zero_grad()
+        for step, batch in enumerate(tqdm(backbone_dataloader)):
+            # Forward pass
+             with accelerator.accumulate(unet):
+                # Convert images to latent space
 
-        #         latents = vae.encode(batch["pixel_values"].to(dtype=torch.float32)).latent_dist.sample()
-        #         latents = latents * 0.18215
+                unet.zero_grad()
+                text_encoder.zero_grad()
 
-        #         # Sample noise that we'll add to the latents
-        #         noise = torch.randn_like(latents)
-        #         bsz = latents.shape[0]
-        #         # Sample a random timestep for each image
-        #         timesteps = torch.randint(
-        #             0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
-        #         )
-        #         timesteps = timesteps.long()
+                for repeat in range(loss_repeat):
 
-        #         # Add noise to the latents according to the noise magnitude at each timestep
-        #         # (this is the forward diffusion process)
-        #         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                    latents = vae.encode(batch["pixel_values"].to(dtype=torch.float32)).latent_dist.sample()
+                    latents = latents * 0.18215
 
-        #         # Get the text embedding for conditioning
-        #         encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                    # Sample noise that we'll add to the latents
+                    noise = torch.randn_like(latents)
+                    bsz = latents.shape[0]
+                    # Sample a random timestep for each image
+                    timesteps = torch.randint(
+                        0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
+                    )
+                    timesteps = timesteps.long()
 
-        #         # Predict the noise residual
-        #         model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    # Add noise to the latents according to the noise magnitude at each timestep
+                    # (this is the forward diffusion process)
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-        #         # Get the target for loss depending on the prediction type
-        #         if noise_scheduler.config.prediction_type == "epsilon":
-        #             target = noise
-        #         elif noise_scheduler.config.prediction_type == "v_prediction":
-        #             target = noise_scheduler.get_velocity(latents, noise, timesteps)
-        #         else:
-        #             raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                    # Get the text embedding for conditioning
+                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
-        #         # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-        #         model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
-        #         target, target_prior = torch.chunk(target, 2, dim=0)
+                    # Predict the noise residual
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-        #         # Compute instance loss
-        #         loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    # Get the target for loss depending on the prediction type
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        target = noise
+                    elif noise_scheduler.config.prediction_type == "v_prediction":
+                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    else:
+                        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-        #         # Compute prior loss
-        #         prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+                    target, target_prior = torch.chunk(target, 2, dim=0)
 
-        #         # Add the prior loss to the instance loss.
-        #         loss = loss + 1 * prior_loss
+                    # Compute instance loss
+                    if repeat == 0:
+                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                        print(loss)
+                        # Compute prior loss
+                        prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+                    #add next losses to the loss
+                    else:
+                        loss += F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                        print(loss)
+                        prior_loss += F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
 
-        #         accelerator.backward(loss)
+                    # Add the prior loss to the instance loss.
+                    loss = loss + 1 * prior_loss
 
-        #         if accelerator.sync_gradients:
-        #             params_to_clip = (
-        #                 itertools.chain(unet.parameters(), text_encoder.parameters())
-        #                 if True
-        #                 else unet.parameters()
-        #             )
-        #             accelerator.clip_grad_norm_(params_to_clip, 1)
+                accelerator.backward(loss)
+
+                if accelerator.sync_gradients:
+                    params_to_clip = (
+                        itertools.chain(unet.parameters(), text_encoder.parameters())
+                        if True
+                        else unet.parameters()
+                    )
+                    accelerator.clip_grad_norm_(params_to_clip, 1)
+
+                grad_dict = {}
+                for k, v in unet.named_parameters():
+                    if "lora_A" in k:
+                        grad_dict[k] = v.grad.cpu()
+                    elif "lora_B" in k:
+                        grad_dict[k] = v.grad.cpu().T
+                    else:
+                        pass
+
+                for k, v in text_encoder.named_parameters():
+                    if "lora_A" in k:
+                        grad_dict[k] = v.grad.cpu()
+                    elif "lora_B" in k:
+                        grad_dict[k] = v.grad.cpu().T
+                    else:
+                        pass
+
+                backbone_grad_dict[step] = grad_dict
+                del grad_dict
 
 
         for step, batch in enumerate(tqdm(train_dataloader)):
@@ -226,48 +264,55 @@ def compute_gradient(args):
                 unet.zero_grad()
                 text_encoder.zero_grad()
 
-                latents = vae.encode(batch["pixel_values"].to(dtype=torch.float32)).latent_dist.sample()
-                latents = latents * 0.18215
+                for repeat in range(loss_repeat):
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
-                )
-                timesteps = timesteps.long()
+                    latents = vae.encode(batch["pixel_values"].to(dtype=torch.float32)).latent_dist.sample()
+                    latents = latents * 0.18215
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                    # Sample noise that we'll add to the latents
+                    noise = torch.randn_like(latents)
+                    bsz = latents.shape[0]
+                    # Sample a random timestep for each image
+                    timesteps = torch.randint(
+                        0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
+                    )
+                    timesteps = timesteps.long()
 
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                    # Add noise to the latents according to the noise magnitude at each timestep
+                    # (this is the forward diffusion process)
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Predict the noise residual
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    # Get the text embedding for conditioning
+                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                    # Predict the noise residual
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-                # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-                model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
-                target, target_prior = torch.chunk(target, 2, dim=0)
+                    # Get the target for loss depending on the prediction type
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        target = noise
+                    elif noise_scheduler.config.prediction_type == "v_prediction":
+                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    else:
+                        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                # Compute instance loss
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+                    target, target_prior = torch.chunk(target, 2, dim=0)
 
-                # Compute prior loss
-                prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+                    # Compute instance loss
+                    if repeat == 0:
+                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-                # Add the prior loss to the instance loss.
-                loss = loss + 1 * prior_loss
+                        # Compute prior loss
+                        prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+                    #add next losses to the loss
+                    else:
+                        loss += F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                        prior_loss += F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+
+                    # Add the prior loss to the instance loss.
+                    loss = loss + 1 * prior_loss
 
                 accelerator.backward(loss)
 
@@ -287,6 +332,15 @@ def compute_gradient(args):
                         grad_dict[k] = v.grad.cpu().T
                     else:
                         pass
+
+                for k, v in text_encoder.named_parameters():
+                    if "lora_A" in k:
+                        grad_dict[k] = v.grad.cpu()
+                    elif "lora_B" in k:
+                        grad_dict[k] = v.grad.cpu().T
+                    else:
+                        pass
+                
                 tr_grad_dict[step] = grad_dict
                 del grad_dict
 
@@ -298,45 +352,55 @@ def compute_gradient(args):
                 unet.zero_grad()
                 text_encoder.zero_grad()
 
-                latents = vae.encode(batch["pixel_values"].to(dtype=torch.float32)).latent_dist.sample()
-                latents = latents * 0.18215
+                for repeat in range(loss_repeat):
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
-                )
-                timesteps = timesteps.long()
+                    latents = vae.encode(batch["pixel_values"].to(dtype=torch.float32)).latent_dist.sample()
+                    latents = latents * 0.18215
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                    # Sample noise that we'll add to the latents
+                    noise = torch.randn_like(latents)
+                    bsz = latents.shape[0]
+                    # Sample a random timestep for each image
+                    timesteps = torch.randint(
+                        0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
+                    )
+                    timesteps = timesteps.long()
 
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                    # Add noise to the latents according to the noise magnitude at each timestep
+                    # (this is the forward diffusion process)
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Predict the noise residual
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    # Get the text embedding for conditioning
+                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                    # Predict the noise residual
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-                # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-                model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
-                target, target_prior = torch.chunk(target, 2, dim=0)
+                    # Get the target for loss depending on the prediction type
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        target = noise
+                    elif noise_scheduler.config.prediction_type == "v_prediction":
+                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    else:
+                        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                # Compute instance loss
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+                    target, target_prior = torch.chunk(target, 2, dim=0)
 
-                # Compute prior loss
-                prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+                    # Compute instance loss
+                    if repeat == 0:
+                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                        # Compute prior loss
+                        prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+                    #add next losses to the loss
+                    else:
+                        loss += F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                        prior_loss += F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+
+                    # Add the prior loss to the instance loss.
+                    loss = loss + 1 * prior_loss
 
                 # Add the prior loss to the instance loss.
                 loss = loss + 1 * prior_loss
@@ -359,26 +423,32 @@ def compute_gradient(args):
                         grad_dict[k] = v.grad.cpu().T
                     else:
                         pass
+
+                for k, v in text_encoder.named_parameters():
+                    if "lora_A" in k:
+                        grad_dict[k] = v.grad.cpu()
+                    elif "lora_B" in k:
+                        grad_dict[k] = v.grad.cpu().T
+                    else:
+                        pass
+
                 val_grad_dict[step] = grad_dict
                 del grad_dict
 
-    return tr_grad_dict, val_grad_dict
+    return tr_grad_dict, val_grad_dict, backbone_grad_dict
 
 def compute_score(tr_grad_dict, val_grad_dict, backbone_grad_dict, lambda_const_param = 10):
 
-    #TODO: replace later
-    backbone_grad_dict = tr_grad_dict
-
     #compute Q
     Q = {}
-    for layer in val_grad_dict[0].keys():
+    for layer in val_grad_dict[0]:
         Q[layer] = torch.zeros(val_grad_dict[0][layer].shape)
-        for val_id in val_grad_dict:
-            Q[layer] += val_grad_dict[val_id][layer] / len(val_grad_dict.keys())
+        for data in val_grad_dict:
+            Q[layer] += val_grad_dict[data][layer] / len(val_grad_dict.keys())
     
     #compute G 
     G = {}
-    for layer in tr_grad_dict[0].keys():
+    for layer in tr_grad_dict[0]:
         G[layer] = torch.zeros(tr_grad_dict[0][layer].shape)
         for data in tr_grad_dict:
             G[layer] += tr_grad_dict[data][layer] / len(tr_grad_dict.keys())
@@ -406,7 +476,7 @@ def compute_score(tr_grad_dict, val_grad_dict, backbone_grad_dict, lambda_const_
             c_tmp_2 = torch.sum(G[layer] * tmp_grad) / (lambda_const + torch.sum(tmp_grad**2))
             #identity matrix is mulitplied with Q[layer] 
             #calculate the backbone gradient likewise
-            hvp_1 += (Q[layer] - c_tmp_1 * tmp_grad) / (len(tr_grad_dict.keys()) * lambda_const)
+            hvp_1 += (Q[layer] - c_tmp_1 * tmp_grad) / (len(val_grad_dict.keys()) * lambda_const)
             hvp_2 += (G[layer] - c_tmp_2 * tmp_grad) / (len(tr_grad_dict.keys()) * lambda_const)
 
         q_g_inv[layer] = hvp_1
@@ -417,7 +487,7 @@ def compute_score(tr_grad_dict, val_grad_dict, backbone_grad_dict, lambda_const_
     for data in backbone_grad_dict:
         tmp_dict = {}
         for layer, lambda_const in zip(q_g_inv, lambda_list):
-            tmp_grad = tr_grad_dict[data][layer]
+            tmp_grad = G[layer]
             c_tmp = torch.sum(backbone_grad_dict[data][layer] * tmp_grad) / (lambda_const + torch.sum(tmp_grad**2))
             hvp = (backbone_grad_dict[data][layer] - c_tmp * tmp_grad) / (len(tr_grad_dict.keys()) * lambda_const)
             tmp_dict[layer] = hvp
@@ -428,17 +498,66 @@ def compute_score(tr_grad_dict, val_grad_dict, backbone_grad_dict, lambda_const_
     for data in b_g_inv: 
         score = 0
         for layer in b_g_inv[data]:
-            tmp_grad = b_g_inv[data][layer] * q_g_inv[layer]
-            score += -torch.trace(tmp_grad) + 2 * torch.trace(tmp_grad * g_g_inv[layer])
-        score_dict[data] = score
+            tmp_grad = torch.sum(b_g_inv[data][layer] * q_g_inv[layer])
+            score += -tmp_grad + 2 * torch.sum(tmp_grad * g_g_inv[layer])
+        score_dict[data] = score.item()
 
+    return score_dict
+
+def compute_data_inf(tr_grad_dict, val_grad_dict, backbone_grad_dict, lambda_const_param = 10):
+    
+    #compute Q
+    Q = {}
+    for layer in val_grad_dict[0]:
+        Q[layer] = torch.zeros(val_grad_dict[0][layer].shape)
+        for val_id in val_grad_dict:
+            Q[layer] += val_grad_dict[val_id][layer] / len(val_grad_dict.keys())
+
+    #compute lambda, QG^-1 and GG^-1
+    q_g_inv = {}
+
+    for layer in Q: 
+        #compute lambda
+        l = torch.zeros(len(tr_grad_dict.keys()))
+        for data in tr_grad_dict:
+            tmp_grad = tr_grad_dict[data][layer]
+            l[data] = torch.mean(tmp_grad**2)
+        lambda_const = torch.mean(l) / lambda_const_param
+
+        #compute G^-1 and QG^-1 and GG^-1
+        hvp_1 = torch.zeros(Q[layer].shape)
+        for data in tr_grad_dict:
+            tmp_grad = tr_grad_dict[data][layer]
+            c_tmp_1 = torch.sum(Q[layer] * tmp_grad) / (lambda_const + torch.sum(tmp_grad**2))
+            #identity matrix is mulitplied with Q[layer] 
+            #calculate the backbone gradient likewise
+            hvp_1 += (Q[layer] - c_tmp_1 * tmp_grad) / (len(tr_grad_dict.keys()) * lambda_const)
+
+        q_g_inv[layer] = hvp_1
+
+    #calculate 
+    score_dict = {}
+
+    #test
+    backbone_grad_dict = tr_grad_dict
+
+    for data in backbone_grad_dict:
+        score = 0
+        for layer in Q:
+            score += torch.sum(q_g_inv[layer] * backbone_grad_dict[data][layer])
+        score_dict[data] = (-score).item()
+    
     return score_dict
 
 if __name__ == '__main__':
     import time 
     start = time.time()
     args = arg_parse()
-    tr_grad_dict, val_grad_dict = compute_gradient(args)
-    score_dict = compute_score(tr_grad_dict, val_grad_dict, None)
-    print(score_dict)
+    tr_grad_dict, val_grad_dict, backbone_grad_dict = compute_gradient(args)
+    # score_dict = compute_score(tr_grad_dict, val_grad_dict, backbone_grad_dict)
+    score_dict = compute_data_inf(tr_grad_dict, val_grad_dict, backbone_grad_dict)
+    #save dict as json
+    import json
+    with open(args.output_path, 'w') as f:
+        json.dump(score_dict, f)
     print(f"Time taken: {time.time() - start}")

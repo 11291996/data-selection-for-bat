@@ -1,0 +1,29 @@
+accelerate launch "./utils/dreambooth_lora.py" \
+  --pretrained_model_name_or_path="CompVis/stable-diffusion-v1-4"  \
+  --instance_data_dir="/scratch2/paneah/dsbat/datasets/military_pilot/military_pilot_instance/train" \
+  --class_data_dir="/scratch2/paneah/dsbat/datasets/military_pilot/military_pilot_class" \
+  --output_dir="/scratch2/paneah/dsbat/models/military_pilot/military_pilot_strong_back" \
+  --train_text_encoder \
+  --with_prior_preservation --prior_loss_weight=1.0 \
+  --num_dataloader_workers=1 \
+  --instance_prompt="a photo of sks military pilot" \
+  --class_prompt="a photo of military pilot" \
+  --resolution=512 \
+  --train_batch_size=1 \
+  --lr_scheduler="constant" \
+  --lr_warmup_steps=0 \
+  --num_class_images=100 \
+  --use_lora \
+  --lora_r 16 \
+  --lora_alpha 27 \
+  --lora_text_encoder_r 16 \
+  --lora_text_encoder_alpha 17 \
+  --learning_rate=1e-4 \
+  --gradient_accumulation_steps=1 \
+  --gradient_checkpointing \
+  --max_train_steps=800 \
+  --backbone_data_dir="/scratch2/paneah/dsbat/datasets/laion_dataset/laion_dataset_img" \
+  --backbone_prompt="/scratch2/paneah/dsbat/datasets/laion_dataset/laion_dataset_text/metadata.json" \
+  --score_data_dir="/scratch2/paneah/dsbat/models/military_pilot/military_pilot_strong/score.json" \
+  --gamma 0.9 \
+  --sample_ratio 1
