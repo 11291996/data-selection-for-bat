@@ -1,8 +1,8 @@
-accelerate launch "./utils/dreambooth_lora.py" \
+accelerate launch "./train_model.py" \
   --pretrained_model_name_or_path="CompVis/stable-diffusion-v1-4"  \
   --instance_data_dir="/scratch2/paneah/dsbat/datasets/military_pilot/military_pilot_instance/train" \
   --class_data_dir="/scratch2/paneah/dsbat/datasets/military_pilot/military_pilot_class" \
-  --output_dir="/scratch2/paneah/dsbat/models/military_pilot/military_pilot_strong_back" \
+  --output_dir="/scratch2/paneah/dsbat/models/military_pilot/military_pilot_strong" \
   --train_text_encoder \
   --with_prior_preservation --prior_loss_weight=1.0 \
   --num_dataloader_workers=1 \
@@ -21,9 +21,4 @@ accelerate launch "./utils/dreambooth_lora.py" \
   --learning_rate=1e-4 \
   --gradient_accumulation_steps=1 \
   --gradient_checkpointing \
-  --max_train_steps=800 \
-  --backbone_data_dir="/scratch2/paneah/dsbat/datasets/laion_dataset/laion_dataset_img" \
-  --backbone_prompt="/scratch2/paneah/dsbat/datasets/laion_dataset/laion_dataset_text/metadata.json" \
-  --score_data_dir="/scratch2/paneah/dsbat/models/military_pilot/military_pilot_strong/score.json" \
-  --gamma 0.9 \
-  --sample_ratio 1
+  --max_train_steps=800

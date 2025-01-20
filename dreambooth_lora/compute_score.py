@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import itertools
 import argparse
 from accelerate import Accelerator
-from utils.dreambooth_lora import DreamBoothDataset, import_model_class_from_model_name_or_path, collate_fn, BackboneDreamBoothDataset
+from .train_model import DreamBoothDataset, import_model_class_from_model_name_or_path, collate_fn, BackboneDreamBoothDataset
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
@@ -15,9 +15,6 @@ from diffusers.optimization import get_scheduler
 from transformers import AutoTokenizer, PretrainedConfig
 from peft import LoraConfig, get_peft_model, PeftModel
 from tqdm import tqdm
-
-UNET_TARGET_MODULES = ["to_q", "to_v", "query", "value"]  # , "ff.net.0.proj"]
-TEXT_ENCODER_TARGET_MODULES = ["q_proj", "v_proj"]
 
 #seed control 
 # torch.manual_seed(0)
@@ -46,6 +43,7 @@ def arg_parse():
     parser.add_argument('--backbone_data', type=str, default='backbone/20ng_backbone.pkl', help='path to backbone model')
     #backbone prompt
     parser.add_argument('--backbone_prompt', type=str, default='backbone', help='prompt for backbone')
+    parser.add_argument('--sampling_count', type=int, default=1, help='noise sampling count')
     args = parser.parse_args()
     return args
 
@@ -164,7 +162,7 @@ def compute_gradient(args):
         val_grad_dict = {}
         backbone_grad_dict = {}
 
-        loss_repeat = 3
+        loss_repeat = args.sampling_count
 
         for step, batch in enumerate(tqdm(backbone_dataloader)):
             # Forward pass
@@ -213,13 +211,11 @@ def compute_gradient(args):
                     # Compute instance loss
                     if repeat == 0:
                         loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                        print(loss)
                         # Compute prior loss
                         prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
                     #add next losses to the loss
                     else:
                         loss += F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                        print(loss)
                         prior_loss += F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
 
                     # Add the prior loss to the instance loss.
@@ -554,8 +550,8 @@ if __name__ == '__main__':
     start = time.time()
     args = arg_parse()
     tr_grad_dict, val_grad_dict, backbone_grad_dict = compute_gradient(args)
-    # score_dict = compute_score(tr_grad_dict, val_grad_dict, backbone_grad_dict)
-    score_dict = compute_data_inf(tr_grad_dict, val_grad_dict, backbone_grad_dict)
+    score_dict = compute_score(tr_grad_dict, val_grad_dict, backbone_grad_dict)
+    # score_dict = compute_data_inf(tr_grad_dict, val_grad_dict, backbone_grad_dict)
     #save dict as json
     import json
     with open(args.output_path, 'w') as f:

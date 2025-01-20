@@ -847,12 +847,10 @@ def main(args):
             center_crop=args.center_crop,
         )
 
-    exit()
-
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
-        shuffle=True,
+        shuffle=False,
         collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
         num_workers=args.num_dataloader_workers,
     )
@@ -1230,17 +1228,30 @@ class BackboneDreamBoothDataset(DreamBoothDataset):
 
             #repeat the instance prompt as a list
             self.instance_prompt = [self.instance_prompt] * self.num_instance_images
-
+            
             #get the number of backbone images to add 
             self.num_backbone_images = round(self.num_instance_images * (1 - self.gamma))
 
             #get the index of the backbone images from the sample score
-            self.backbone_index = list(self.sample_score.keys())[:self.num_backbone_images]
+
+            score_items = list(self.sample_score.keys())
+
+            # #for random sampling
+            # score_items.reverse()
+
+            self.backbone_index = score_items[:self.num_backbone_images]
 
             for idx in self.backbone_index:
                 idx = int(idx)
                 self.instance_images_path.append(self.backbone_data_path[idx])
                 self.instance_prompt.append(self.backbone_prompt[idx])
+
+            #set old length and add the new length
+            self.old_length = self.num_instance_images
+            self.num_instance_images = len(self.instance_images_path)
+
+        else:
+            self.backbone_data_root = None
 
             
     def __len__(self):
@@ -1249,8 +1260,10 @@ class BackboneDreamBoothDataset(DreamBoothDataset):
     def __getitem__(self, index):
         example = {}
         instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
+        print(self.instance_images_path[index % self.num_instance_images])
         if isinstance(self.instance_prompt, list):
             instance_prompt = self.instance_prompt[index % self.num_instance_images]
+            print(instance_prompt)
         else:
             instance_prompt = self.instance_prompt
         if not instance_image.mode == "RGB":
@@ -1266,12 +1279,14 @@ class BackboneDreamBoothDataset(DreamBoothDataset):
 
         if self.class_data_root:
             #matching the class images with the added backbone images
-            if index % self.num_instance_images > self.num_instance_images:
-                #get the idx from self.backbone_index
-                #match the idx with the class image for the backbone image
-                idx = self.backbone_index[(index % self.num_instance_images) - self.num_instance_images]
-                print(idx)
-                class_image = Image.open(self.class_images_path[idx % self.num_class_images])
+            if self.backbone_data_root:
+                if index % self.num_instance_images > self.old_length:
+                    #get the idx from self.backbone_index
+                    #match the idx with the class image for the backbone image
+                    idx = int(self.backbone_index[(index % self.num_instance_images) - self.num_instance_images])
+                    class_image = Image.open(self.class_images_path[idx % self.num_class_images])
+                else:
+                    class_image = Image.open(self.class_images_path[index % self.num_class_images])
             else:
                 class_image = Image.open(self.instance_images_path[index % self.num_instance_images])
 
@@ -1291,3 +1306,4 @@ class BackboneDreamBoothDataset(DreamBoothDataset):
 if __name__ == "__main__":
     args = parse_args()
     main(args)
+    

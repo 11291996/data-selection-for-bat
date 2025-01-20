@@ -1,0 +1,9 @@
+python ./train_lora.py --train_path="/home/paneah/Desktop/data-selection-for-bat/dsbat/datasets/nlp_datasets/arc-c.train.json" \
+    --eval_path="/home/paneah/Desktop/data-selection-for-bat/dsbat/datasets/nlp_datasets/arc-c.val.json" \
+    --epochs=1 \
+    --batch_size=1 \
+    --output_dir="/home/paneah/Desktop/data-selection-for-bat/dsbat/models/nlp" \
+    --backbone_path="/home/paneah/Desktop/data-selection-for-bat/dsbat/datasets/nlp_datasets/alpaca_data.json" \
+    --score_path="/home/paneah/Desktop/data-selection-for-bat/dsbat/models/nlp/lora/arc-c/score.json" \
+    --gamma=0.95 \
+    --sample_ratio=1 \
